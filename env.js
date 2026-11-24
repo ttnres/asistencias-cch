@@ -1,0 +1,8 @@
+window.ENV = {
+  APPS_SCRIPT_URL: "PEGA_AQUI_TU_URL_EXEC",
+  APP_NAME: "Control de Asistencias Académicas",
+  INSTITUTION: "CCH Plantel Oriente - UNAM",
+  DEFAULT_CICLO: "2027-1",
+  MIN_ATTENDANCE_PERCENT: 80,
+  WARNING_ATTENDANCE_PERCENT: 85
+};
