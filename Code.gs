@@ -9,7 +9,7 @@ const DATABASE_SCHEMA_ = [
   },
   {
     name: "Attendance Log",
-    headers: ["id", "fk_id_student", "Cuenta", "Course", "Date", "Time"]
+    headers: ["id", "fk_id_student", "Cuenta", "Course", "Date", "Time", "Estado"]
   },
   {
     name: "Roles",
@@ -103,11 +103,11 @@ function dispatchRequest_(action, payload, token) {
   if (action === "getAttendanceMatrix") {
     return getAttendanceMatrix_(session, payload.cicloEscolar, payload.idCurso);
   }
+  if (action === "saveAttendanceChanges") {
+    return saveAttendanceChanges_(session, payload);
+  }
   if (action === "generateReport") {
     return generateReport_(session, payload);
-  }
-  if (action === "toggleAttendance") {
-    return toggleAttendance_(session, payload);
   }
   if (action === "runSetup") {
     requireAdministrator_(session);
@@ -309,14 +309,22 @@ function getAttendanceMatrix_(session, cicloEscolar, idCurso) {
       return;
     }
 
+    const state = normalizarEstadoAsistencia_(row.Estado);
+    if (!state) {
+      warnings.push("Se omitió un registro del curso " + courseId + " con un Estado no reconocido.");
+      return;
+    }
+
     datesByIso[isoDate] = true;
     const account = normalizarId_(studentsById[studentId].Cuenta);
     const key = account + "|" + isoDate;
     attendanceKeys.add(key);
     if (!attendanceByAccountAndDate[key]) {
       attendanceByAccountAndDate[key] = {
-        presente: true,
-        hora: normalizarHora_(row.Time),
+        estado: state,
+        presente: state === "Asistencia",
+        justificada: state === "Justificada",
+        hora: state === "Asistencia" ? normalizarHora_(row.Time) : "",
         logId: String(row.id || "")
       };
     }
@@ -332,12 +340,24 @@ function getAttendanceMatrix_(session, cicloEscolar, idCurso) {
       const details = attendanceByAccountAndDate[key];
       return attendanceKeys.has(key) && details
         ? details
-        : { presente: false, hora: "", logId: "" };
+        : {
+          estado: "Falta",
+          presente: false,
+          justificada: false,
+          hora: "",
+          logId: ""
+        };
     });
     const totalAttendance = attendance.filter(function (status) {
-      return status.presente;
+      return status.estado === "Asistencia";
     }).length;
-    const totalAbsences = attendance.length - totalAttendance;
+    const totalAbsences = attendance.filter(function (status) {
+      return status.estado === "Falta";
+    }).length;
+    const totalJustified = attendance.filter(function (status) {
+      return status.estado === "Justificada";
+    }).length;
+    const eligibleDays = attendance.length - totalJustified;
 
     return {
       ID: student.ID,
@@ -347,7 +367,12 @@ function getAttendanceMatrix_(session, cicloEscolar, idCurso) {
       Course: student.Course,
       asistencias: totalAttendance,
       faltas: totalAbsences,
-      porcentaje: dates.length ? Math.round((totalAttendance / dates.length) * 10000) / 100 : 0,
+      justificadas: totalJustified,
+      porcentaje: attendance.length
+        ? (eligibleDays
+          ? Math.round((totalAttendance / eligibleDays) * 10000) / 100
+          : 100)
+        : 0,
       estados: attendance
     };
   }).sort(function (left, right) {
@@ -369,101 +394,162 @@ function getAttendanceMatrix_(session, cicloEscolar, idCurso) {
   };
 }
 
-function toggleAttendance_(session, payload) {
+function saveAttendanceChanges_(session, payload) {
   const courseId = normalizarId_(payload.idCurso);
-  const studentId = normalizarId_(payload.idEstudiante);
   const cycle = String(payload.cicloEscolar || "").trim();
-  const isoDate = aFechaISO_(payload.fecha);
-  if (!courseId || !studentId || !cycle || !isoDate) {
-    throw new Error("Se requieren idCurso, idEstudiante, cicloEscolar y una fecha ISO válida.");
+  const changes = payload.changes;
+  if (!courseId || !cycle || !Array.isArray(changes) || !changes.length) {
+    throw new Error("Se requieren idCurso, cicloEscolar y al menos un cambio.");
+  }
+  if (changes.length > 500) {
+    throw new Error("Guarda como máximo 500 cambios por solicitud.");
   }
   requireCourseAccess_(session, courseId);
 
   const lock = LockService.getDocumentLock();
   lock.waitLock(30000);
   try {
-    const courseRows = readRows_("Course").filter(function (row) {
-      return normalizarId_(row.ID_Curso) === courseId;
-    });
-    const cycleIds = Array.from(new Set(courseRows.map(function (row) {
-      return String(row.Ciclo_Escolar || "").trim();
-    })));
-    if (cycleIds.length > 1) {
-      throw new Error(
-        "ID_Curso " + courseId + " aparece en varios ciclos. Asigne un ID_Curso único a cada curso/ciclo."
-      );
-    }
-    const course = courseRows.filter(function (row) {
-      return String(row.Ciclo_Escolar || "").trim() === cycle && isActive_(row.Activo);
-    })[0];
-    if (!course) {
-      throw new Error("No existe un curso activo con ese ID_Curso y ciclo escolar.");
-    }
-
-    const students = readRows_("Students");
-    const student = students.filter(function (row) {
-      return normalizarId_(row.ID) === studentId &&
-        normalizarId_(row.Course) === courseId;
-    })[0];
-    if (!student) {
-      throw new Error("El alumno no está inscrito en el curso y ciclo seleccionados.");
-    }
-
-    const attendanceSheet = getSpreadsheet_().getSheetByName("Attendance Log");
-    const attendanceRows = readRows_("Attendance Log");
-    const matchingRows = [];
-    attendanceRows.forEach(function (row, index) {
-      if (normalizarId_(row.Course) === courseId &&
-          aFechaISO_(row.Date) === isoDate &&
-          logMatchesStudent_(row, student)) {
-        matchingRows.push(index + 2);
+    const matrix = getAttendanceMatrix_(session, cycle, courseId);
+    const studentsById = {};
+    const studentIdsByAccount = {};
+    matrix.students.forEach(function (student) {
+      const studentId = normalizarId_(student.ID);
+      studentsById[studentId] = student;
+      const account = normalizarId_(student.Cuenta);
+      if (account) {
+        if (!studentIdsByAccount[account]) {
+          studentIdsByAccount[account] = {};
+        }
+        studentIdsByAccount[account][studentId] = true;
       }
     });
 
-    if (matchingRows.length) {
-      matchingRows.sort(function (left, right) {
-        return right - left;
-      }).forEach(function (rowNumber) {
-        attendanceSheet.deleteRow(rowNumber);
-      });
-      return { success: true, presente: false, message: "Asistencia eliminada." };
-    }
+    const seenChanges = {};
+    const normalizedChanges = changes.map(function (change) {
+      const studentId = normalizarId_(change.idEstudiante);
+      const student = studentsById[studentId];
+      const isoDate = aFechaISO_(change.fecha);
+      const requestedState = String(change.estado || "").trim();
+      const state = normalizarEstadoAsistencia_(change.estado);
+      if (!student || !isoDate || !requestedState || !state) {
+        throw new Error("Cada cambio debe identificar un alumno inscrito, una fecha válida y un estado permitido.");
+      }
+      const key = studentId + "|" + isoDate;
+      if (seenChanges[key]) {
+        throw new Error("La solicitud contiene cambios duplicados para un mismo alumno y fecha.");
+      }
+      seenChanges[key] = true;
+      return {
+        key: key,
+        studentId: studentId,
+        student: student,
+        isoDate: isoDate,
+        estado: state
+      };
+    });
 
-    const account = normalizarId_(student.Cuenta);
-    const accountNumber = Number(account);
+    const attendanceSheet = getSpreadsheet_().getSheetByName("Attendance Log");
+    const existingRows = readRowsWithRowNumbers_("Attendance Log");
+    const rowsByStudentAndDate = {};
+    existingRows.forEach(function (entry) {
+      const row = entry.record;
+      if (normalizarId_(row.Course) !== courseId) {
+        return;
+      }
+      const isoDate = aFechaISO_(row.Date);
+      const studentId = findStudentIdForLog_(row, studentsById, studentIdsByAccount);
+      if (!isoDate || !studentId) {
+        return;
+      }
+      const key = studentId + "|" + isoDate;
+      if (!rowsByStudentAndDate[key]) {
+        rowsByStudentAndDate[key] = [];
+      }
+      rowsByStudentAndDate[key].push(entry);
+    });
+
+    const accountNumberByStudent = {};
+    normalizedChanges.forEach(function (change) {
+      const account = normalizarId_(change.student.Cuenta);
+      const accountNumber = Number(account);
+      if (!/^\d{9}$/.test(account) || !Number.isSafeInteger(accountNumber)) {
+        throw new Error("La Cuenta del alumno debe contener exactamente nueve dígitos.");
+      }
+      accountNumberByStudent[change.studentId] = accountNumber;
+    });
     const courseNumber = Number(courseId);
-    if (!/^\d{9}$/.test(account) || !Number.isSafeInteger(accountNumber)) {
-      throw new Error("La Cuenta del alumno debe contener exactamente nueve dígitos.");
-    }
     if (!/^\d+$/.test(courseId) || !Number.isSafeInteger(courseNumber)) {
       throw new Error("ID_Curso debe ser un código numérico seguro para almacenarse en Sheets.");
     }
 
-    const now = new Date();
-    const timeZone = getSpreadsheet_().getSpreadsheetTimeZone();
-    const currentTime = Utilities.formatDate(now, timeZone, "HH:mm:ss");
-    const dateValue = Utilities.parseDate(isoDate, timeZone, "yyyy-MM-dd");
-    const timeValue = Utilities.parseDate(currentTime, timeZone, "HH:mm:ss");
-    const logId = createUniqueLogId_(attendanceRows);
-    const newRow = Math.max(attendanceSheet.getLastRow() + 1, 2);
+    const spreadsheet = getSpreadsheet_();
+    const timeZone = spreadsheet.getSpreadsheetTimeZone();
+    const currentTime = Utilities.formatDate(new Date(), timeZone, "HH:mm:ss");
+    const currentTimeValue = Utilities.parseDate(currentTime, timeZone, "HH:mm:ss");
+    const rowsToUpdate = [];
+    const rowsToDelete = [];
+    const rowsToAppend = [];
+    const usedIds = existingRows.map(function (entry) {
+      return entry.record;
+    });
 
-    attendanceSheet.getRange(newRow, 1, 1, 6).setValues([[
-      logId,
-      String(student.ID),
-      accountNumber,
-      courseNumber,
-      dateValue,
-      timeValue
-    ]]);
-    attendanceSheet.getRange(newRow, 5).setNumberFormat("dd/MM/yyyy");
-    attendanceSheet.getRange(newRow, 6).setNumberFormat("HH:mm:ss");
+    normalizedChanges.forEach(function (change) {
+      const matches = rowsByStudentAndDate[change.key] || [];
+      const existing = matches.length ? matches[0] : null;
+      const dateValue = Utilities.parseDate(change.isoDate, timeZone, "yyyy-MM-dd");
+      let timeValue = "";
+      if (change.estado === "Asistencia") {
+        const existingTime = existing ? normalizarHora_(existing.record.Time) : "";
+        timeValue = existingTime
+          ? Utilities.parseDate(existingTime, timeZone, "HH:mm:ss")
+          : currentTimeValue;
+      }
+      const id = existing && existing.record.id
+        ? String(existing.record.id)
+        : createUniqueLogId_(usedIds.concat(rowsToAppend.map(function (row) {
+          return { id: row[0] };
+        })));
+      const values = [
+        id,
+        String(change.student.ID),
+        accountNumberByStudent[change.studentId],
+        courseNumber,
+        dateValue,
+        timeValue,
+        change.estado
+      ];
+
+      if (existing) {
+        rowsToUpdate.push({ rowNumber: existing.rowNumber, values: values });
+        matches.slice(1).forEach(function (duplicate) {
+          rowsToDelete.push(duplicate.rowNumber);
+        });
+      } else {
+        rowsToAppend.push(values);
+      }
+    });
+
+    rowsToUpdate.forEach(function (update) {
+      attendanceSheet.getRange(update.rowNumber, 1, 1, 7).setValues([update.values]);
+      attendanceSheet.getRange(update.rowNumber, 5).setNumberFormat("dd/MM/yyyy");
+      attendanceSheet.getRange(update.rowNumber, 6).setNumberFormat("HH:mm:ss");
+    });
+    rowsToDelete.sort(function (left, right) {
+      return right - left;
+    }).forEach(function (rowNumber) {
+      attendanceSheet.deleteRow(rowNumber);
+    });
+    rowsToAppend.forEach(function (values) {
+      const newRow = Math.max(attendanceSheet.getLastRow() + 1, 2);
+      attendanceSheet.getRange(newRow, 1, 1, 7).setValues([values]);
+      attendanceSheet.getRange(newRow, 5).setNumberFormat("dd/MM/yyyy");
+      attendanceSheet.getRange(newRow, 6).setNumberFormat("HH:mm:ss");
+    });
 
     return {
       success: true,
-      presente: true,
-      hora: currentTime,
-      logId: logId,
-      message: "Asistencia registrada."
+      savedCount: normalizedChanges.length,
+      message: normalizedChanges.length + " cambios de asistencia guardados."
     };
   } finally {
     lock.releaseLock();
@@ -521,6 +607,7 @@ function generateReport_(session, payload) {
       "Alumno",
       "Asistencias",
       "Faltas",
+      "Justificadas",
       "% Asistencia"
     ].concat(dateIndexes.map(function (dateIndex) {
       return matrix.dates[dateIndex].label;
@@ -532,7 +619,7 @@ function generateReport_(session, payload) {
 
     matrix.students.forEach(function (student) {
       const attendanceValues = dateIndexes.map(function (dateIndex) {
-        return student.estados[dateIndex].presente ? "Asistencia" : "Falta";
+        return student.estados[dateIndex].estado;
       });
       values.push([
         String(student.ID || ""),
@@ -540,6 +627,7 @@ function generateReport_(session, payload) {
         String(student["First Name"] || ""),
         student.asistencias,
         student.faltas,
+        student.justificadas,
         student.porcentaje / 100
       ].concat(attendanceValues));
       backgrounds.push([
@@ -548,9 +636,13 @@ function generateReport_(session, payload) {
         "#ffffff",
         "#ffffff",
         "#ffffff",
+        "#ffffff",
         "#ffffff"
       ].concat(attendanceValues.map(function (status) {
-        return status === "Asistencia" ? "#d1e7dd" : "#f8d7da";
+        if (status === "Asistencia") {
+          return "#d1e7dd";
+        }
+        return status === "Justificada" ? "#dceaf2" : "#f8d7da";
       })));
     });
 
@@ -587,9 +679,9 @@ function generateReport_(session, payload) {
       .setFontColor("#ffffff")
       .setFontWeight("bold");
     if (values.length > 1) {
-      reportSheet.getRange(2, 6, values.length - 1, 1).setNumberFormat("0.00%");
+      reportSheet.getRange(2, 7, values.length - 1, 1).setNumberFormat("0.00%");
     }
-    const removedEmptyDateColumns = removeDateColumnsWithoutAttendance_(reportSheet, 7);
+    const removedEmptyDateColumns = removeDateColumnsWithoutAttendance_(reportSheet, 8);
     const staleColumns = oldLastColumn - headers.length;
     if (staleColumns > 0) {
       reportSheet.deleteColumns(headers.length + 1, staleColumns);
@@ -601,7 +693,7 @@ function generateReport_(session, payload) {
       success: true,
       sheetName: reportName,
       studentCount: matrix.students.length,
-      dateColumnCount: reportSheet.getLastColumn() - 6,
+      dateColumnCount: reportSheet.getLastColumn() - 7,
       removedAllAbsenceDateColumns: matrix.dates.length - dateIndexes.length +
         removedEmptyDateColumns + Math.max(staleColumns, 0),
       message: "Reporte generado o actualizado en la hoja " + reportName + "."
@@ -652,6 +744,12 @@ function removeDateColumnsWithoutAttendance_(sheet, firstDateColumn) {
 }
 
 function readRows_(sheetName) {
+  return readRowsWithRowNumbers_(sheetName).map(function (entry) {
+    return entry.record;
+  });
+}
+
+function readRowsWithRowNumbers_(sheetName) {
   const sheet = getSpreadsheet_().getSheetByName(sheetName);
   if (!sheet) {
     throw new Error("No existe la hoja requerida: " + sheetName + ". Ejecute setupDatabase().");
@@ -660,8 +758,11 @@ function readRows_(sheetName) {
   const table = DATABASE_SCHEMA_.filter(function (item) {
     return item.name === sheetName;
   })[0];
+  if (!table) {
+    throw new Error("No existe una definición de tabla para la hoja: " + sheetName + ".");
+  }
   const values = sheet.getDataRange().getValues();
-  if (!table || values.length < 2) {
+  if (values.length < 2) {
     return [];
   }
 
@@ -676,16 +777,17 @@ function readRows_(sheetName) {
     }
   });
 
-  return values.slice(1).filter(function (row) {
-    return row.some(function (value) {
-      return value !== "" && value !== null;
-    });
-  }).map(function (row) {
+  return values.slice(1).map(function (row, index) {
     const record = {};
     table.headers.forEach(function (header) {
       record[header] = row[headers.indexOf(header)];
     });
-    return record;
+    return { rowNumber: index + 2, record: record };
+  }).filter(function (entry) {
+    return Object.keys(entry.record).some(function (header) {
+      const value = entry.record[header];
+      return value !== "" && value !== null;
+    });
   });
 }
 
@@ -702,14 +804,6 @@ function findStudentIdForLog_(logRow, studentsById, studentIdsByAccount) {
   }
   const ids = Object.keys(matchingIds);
   return ids.length === 1 ? ids[0] : "";
-}
-
-function logMatchesStudent_(logRow, student) {
-  const foreignKey = normalizarId_(logRow.fk_id_student);
-  if (foreignKey) {
-    return foreignKey === normalizarId_(student.ID);
-  }
-  return normalizarId_(logRow.Cuenta) === normalizarId_(student.Cuenta);
 }
 
 function requireSession_(token) {
@@ -768,6 +862,23 @@ function normalizarId_(value) {
     return String(Math.trunc(value));
   }
   return String(value).trim().replace(/\.0+$/, "").toUpperCase();
+}
+
+function normalizarEstadoAsistencia_(value) {
+  const state = String(value || "").trim().toLowerCase();
+  if (!state) {
+    return "Asistencia";
+  }
+  if (state === "asistencia") {
+    return "Asistencia";
+  }
+  if (state === "falta") {
+    return "Falta";
+  }
+  if (state === "justificada") {
+    return "Justificada";
+  }
+  return "";
 }
 
 function normalizeEmail_(value) {

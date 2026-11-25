@@ -25,7 +25,7 @@ La interfaz consulta una combinación de **un curso y un ciclo escolar a la vez*
 - Define e inicializa las cuatro tablas mediante `setupDatabase()`. El menú de Sheets **📋 Sistema Asistencias → Verificar / Renombrar Encabezados (AppSheet)** llama la misma función.
 - Crea las hojas faltantes y reemplaza únicamente la fila 1 de las hojas existentes; no limpia ni reordena las filas de datos. Aplica fondo negro, texto blanco en negritas y congela la fila de encabezados.
 - Expone `doGet` y `doPost`, con respuestas JSON de `ContentService`. Los errores se devuelven explícitamente como `{ success: false, error: "..." }`.
-- Implementa `login`, `getBootstrapData`, `getAttendanceMatrix`, `toggleAttendance`, `generateReport` y `runSetup`.
+- Implementa `login`, `getBootstrapData`, `getAttendanceMatrix`, `saveAttendanceChanges`, `generateReport` y `runSetup`.
 - Usa propiedades del script para las credenciales y una sesión temporal en `CacheService`. Las escrituras manuales se protegen con `LockService`.
 - Normaliza identificadores, interpreta fechas `d/MM/yyyy`, `dd/MM/yyyy` e ISO, y busca coincidencias de asistencia en mapas por alumno/fecha.
 - Al generar un reporte, limita las columnas de fecha a las que contienen al menos una asistencia. Elimina las columnas de fechas sin ninguna celda que contenga `Asistencia` (sin distinguir mayúsculas/minúsculas), reescribe la matriz de esa pestaña y conserva las demás hojas del libro.
@@ -36,11 +36,11 @@ Configuración pública cargada por la web. Reemplaza `PEGA_AQUI_TU_URL_EXEC` po
 
 ### `index.html`
 
-Contiene la pantalla institucional de bienvenida, formulario de acceso y panel responsivo con Bootstrap 5.3.3. Carga SheetJS desde CDN para escribir libros `.xlsx`.
+Contiene la pantalla institucional de bienvenida, formulario de acceso y panel responsivo con Bootstrap 5.3.3. La identidad visual usa azul y oro UNAM; los colores verde/amarillo/rojo se conservan para los indicadores semáforo. Carga SheetJS desde CDN para escribir libros `.xlsx`.
 
 ### `app.js`
 
-Consume la API, filtra cursos por ciclo, presenta la matriz y sus totales, permite marcar o retirar manualmente una asistencia, genera el reporte físico bajo demanda y exporta el grupo actualmente seleccionado. Si `APPS_SCRIPT_URL` conserva el marcador de posición, abre una demostración local con datos ficticios; no inicia sesión en el backend ni escribe en Sheets. Al configurar la URL `/exec` y recargar la página, cambia automáticamente al backend real y deja de usar esos datos.
+Consume la API, filtra cursos por ciclo, presenta la matriz y sus totales, permite alternar cada celda entre `Asistencia`, `Falta` y `Justificada`, genera el reporte físico bajo demanda y exporta únicamente el grupo actualmente seleccionado. Los cambios quedan en memoria hasta pulsar **Guardar**; el envío por lote usa el bloqueo del documento y, si falla, la interfaz conserva los cambios pendientes. La hora se muestra en un popover al pasar el cursor sobre una celda de asistencia, sin icono adicional. Si `APPS_SCRIPT_URL` conserva el marcador de posición, abre una demostración local con datos ficticios; no inicia sesión en el backend ni escribe en Sheets. Al configurar la URL `/exec` y recargar la página, cambia automáticamente al backend real y deja de usar esos datos.
 
 ### `README.md`
 
@@ -54,12 +54,14 @@ Los encabezados son exactos, están en la fila 1 y el orden es significativo par
 | --- | --- | --- |
 | `Course` | Un registro por grupo/materia | `ID_Curso`, `Nombre Curso`, `Grupo`, `Horario`, `Ciclo_Escolar`, `Hoja_Reporte`, `Activo` |
 | `Students` | Un registro por inscripción | `ID`, `Cuenta`, `First Name`, `Email`, `Course` |
-| `Attendance Log` | Asistencias QR y manuales | `id`, `fk_id_student`, `Cuenta`, `Course`, `Date`, `Time` |
+| `Attendance Log` | Asistencia, falta y justificación | `id`, `fk_id_student`, `Cuenta`, `Course`, `Date`, `Time`, `Estado` |
 | `Roles` | Rol y alcance de curso | `ID`, `ID_Curso`, `Nombre`, `Correo`, `Rol` |
 
 `setupDatabase()` garantiza esas cuatro hojas y encabezados, pero no elimina hojas adicionales. La acción **Generar hoja Reporte** crea intencionalmente una pestaña adicional de salida; por ello, el libro tendrá las cuatro tablas base más las pestañas de reportes que se generen. Para conservar un libro con solo cuatro pestañas, no uses esa acción. Las hojas preexistentes no se eliminan automáticamente.
 
-Las columnas `Attendance Log.Cuenta` y `Attendance Log.Course` se escriben como números cuando se registra asistencia manual. `Date` y `Time` se guardan como valores de fecha/hora de Sheets con formatos `dd/MM/yyyy` y `HH:mm:ss`. El ID de asistencia manual es un hexadecimal en minúsculas de ocho caracteres; el identificador de alumno se toma de `Students.ID`.
+`Attendance Log.Estado` admite `Asistencia`, `Falta` o `Justificada`. Las marcas de `Asistencia` conservan la hora en `Time`; las filas de falta o justificación dejan `Time` vacío. `Date` se guarda como fecha de Sheets con formato `dd/MM/yyyy`. El ID de registro es un hexadecimal en minúsculas de ocho caracteres; el identificador de alumno se toma de `Students.ID`. Las filas QR antiguas con `Estado` vacío se interpretan como `Asistencia`.
+
+El esquema de `Attendance Log` se amplió de seis a siete columnas para persistir los estados solicitados. Ejecuta `setupDatabase()` para normalizar el encabezado; las filas existentes se conservan. Después, en AppSheet, regenera la estructura de `Attendance Log` e incorpora la columna `Estado`.
 
 ## Ciclos escolares e inscripciones
 
@@ -68,17 +70,17 @@ Las columnas `Attendance Log.Cuenta` y `Attendance Log.Course` se escriben como 
 1. Asigna un `ID_Curso` único a cada grupo/materia de cada ciclo, conserva ese código en `Students.Course` y `Attendance Log.Course`, y no lo reutilices en otro ciclo.
 2. Para no mezclar historiales, el backend detecta un `ID_Curso` que aparezca en varios ciclos y rechaza la consulta o edición en vez de adivinar a cuál corresponde.
 3. La cuenta de un alumno puede repetirse en inscripciones de ciclos diferentes siempre que cada inscripción utilice su propio `ID` y `ID_Curso`.
-4. Los registros de asistencia que no correspondan a una inscripción del curso seleccionado no se agregan a la matriz. Los registros del curso con una fecha inválida se omiten y se notifican en el panel.
+4. Los registros que no correspondan a una inscripción del curso seleccionado no se agregan a la matriz. Los registros del curso con fecha o estado inválido se omiten y se notifican en el panel.
 
-El denominador del porcentaje es el número de fechas únicas que tienen por lo menos una asistencia válida para ese curso. Por ello, una fecha sin ningún registro en `Attendance Log` no se puede inferir como día impartido ni contar como falta; para una lista completa de clases se necesitaría una tabla de sesiones/calendario, que no forma parte del esquema pedido.
+El porcentaje excluye del denominador las fechas `Justificada`; estas tampoco incrementan `Faltas`. Si todas las fechas son justificadas, el porcentaje es 100 %. Una fecha sin ningún registro en `Attendance Log` no se puede inferir como día impartido ni contar como falta; para una lista completa de clases se necesitaría una tabla de sesiones/calendario, que no forma parte del esquema pedido.
 
 ## Generar hoja física de reporte
 
 1. Selecciona ciclo y grupo, y pulsa **Cargar matriz**. Esa acción solo consulta; no escribe en Sheets.
 2. Pulsa **Generar hoja Reporte** para crear o actualizar la pestaña del grupo. El nombre sale de `Course.Hoja_Reporte`; si está vacío, se usa `Reporte_<ID_Curso>`. El nombre debe contener `Reporte` en cualquier posición y combinación de mayúsculas/minúsculas.
-3. La pestaña contiene datos del alumno, totales y una columna por fecha con asistencia. Cada celda de fecha se escribe como `Asistencia` o `Falta`.
+3. La pestaña contiene datos del alumno, totales y una columna por fecha con asistencia. Cada celda conserva el estado `Asistencia`, `Falta` o `Justificada`.
 4. Al actualizar, el generador reemplaza el contenido de la matriz en esa pestaña; no modifica las otras pestañas del libro. Las columnas de fecha anteriores que ya no correspondan se quitan de la salida. Además, se eliminan columnas de fecha cuyo contenido no incluya `Asistencia`, sin distinguir mayúsculas/minúsculas.
-5. Las fechas se originan en registros válidos de `Attendance Log` para el curso y ciclo. Una fecha sin ninguna asistencia válida no se crea, así no puede quedar una columna compuesta solo por `Falta`.
+5. Las fechas se originan en registros válidos de `Attendance Log` para el curso y ciclo. La limpieza elimina columnas físicas que no contienen `Asistencia`; las justificaciones permanecen en la matriz base.
 
 La regla de eliminación se ejecuta al generar/actualizar el reporte, no como un disparador automático cuando alguien edita manualmente una hoja en Sheets. Para ejecutar la limpieza y actualización usa el botón del panel.
 
@@ -101,13 +103,13 @@ Las acciones protegidas reciben `token`, emitido al iniciar sesión y almacenado
 | `login` | `user`, `pass` | Token y rol de sesión |
 | `getBootstrapData` | — | Ciclos, cursos permitidos, alumnos de esos cursos y registros de rol pertinentes |
 | `getAttendanceMatrix` | `cicloEscolar`, `idCurso` | Curso, fechas ordenadas, estados y totales por alumno |
-| `toggleAttendance` | `cicloEscolar`, `idCurso`, `idEstudiante`, `fecha` (`yyyy-MM-dd`) | Inserta una marca o retira las existentes para ese alumno/curso/fecha |
+| `saveAttendanceChanges` | `cicloEscolar`, `idCurso`, `changes[]` (`idEstudiante`, `fecha`, `estado`) | Persiste por lote los estados pendientes de la matriz |
 | `generateReport` | `cicloEscolar`, `idCurso` | Crea/actualiza la pestaña de reporte y elimina columnas de fecha sin `Asistencia` |
 | `runSetup` | — | Verifica/normaliza encabezados (solo administrador) |
 
 `doGet` también acepta `action`, `token` y los parámetros correspondientes en la query string. La interfaz utiliza `doPost` para no exponer credenciales o tokens en la URL.
 
-La matriz devuelve fechas `{ iso, label }` y para cada alumno `estados`, con `{ presente, hora, logId }` por fecha, además de `asistencias`, `faltas` y `porcentaje`. Los IDs QR preexistentes y los IDs manuales se tratan como texto hexadecimal.
+La matriz devuelve fechas `{ iso, label }` y para cada alumno `estados`, con `{ estado, presente, justificada, hora, logId }` por fecha, además de `asistencias`, `faltas`, `justificadas` y `porcentaje`. Al pulsar una celda, la interfaz alterna `Asistencia → Falta → Justificada` sin escribir en Sheets. El botón **Guardar** del encabezado envía los cambios juntos; si la solicitud falla, los cambios permanecen pendientes. Las justificaciones se excluyen del porcentaje y del total de faltas.
 
 ## Autenticación y permisos
 
@@ -126,8 +128,9 @@ La matriz devuelve fechas `{ iso, label }` y para cada alumno `estados`, con `{ 
 2. En **Extensiones → Apps Script**, reemplaza el contenido de `Code.gs` con el archivo entregado. El proyecto debe estar vinculado al libro.
 3. Guarda y ejecuta `setupDatabase()` desde el editor. Autoriza los permisos solicitados. Verifica que existan los cuatro encabezados exactos y que los datos anteriores permanezcan debajo de la fila 1.
 4. Comprueba que cada `Course.ID_Curso` sea único entre ciclos y que los valores de `Students.Course` y `Attendance Log.Course` coincidan con ese código.
-5. Configura `ADMIN_USER` y `ADMIN_PASS` en las propiedades del script. Usa una contraseña fuerte y no la escribas en archivos del repositorio.
-6. Despliega como **Aplicación web**. Selecciona ejecutar como el propietario del script. Configura el acceso para las personas autorizadas por la política institucional; evita permitir escritura pública. Copia la URL que termina en `/exec`.
+5. Ejecuta `setupDatabase()` después de esta actualización: normaliza el encabezado nuevo `Estado` sin borrar filas. Luego regenera en AppSheet la estructura de `Attendance Log`.
+6. Configura `ADMIN_USER` y `ADMIN_PASS` en las propiedades del script. Usa una contraseña fuerte y no la escribas en archivos del repositorio.
+7. Despliega como **Aplicación web**. Selecciona ejecutar como el propietario del script. Configura el acceso para las personas autorizadas por la política institucional; evita permitir escritura pública. Copia la URL que termina en `/exec`.
 
 ### 2. Publicar en GitHub Pages
 
@@ -135,7 +138,7 @@ La matriz devuelve fechas `{ iso, label }` y para cada alumno `estados`, con `{ 
 2. En `env.js`, reemplaza el valor de `APPS_SCRIPT_URL` por la URL `/exec` recién desplegada.
 3. Habilita GitHub Pages para la rama y carpeta correspondientes. Abre la URL HTTPS publicada.
 4. Antes de configurar `/exec`, puedes usar **Entrar a demostración local** para probar la interfaz con datos ficticios. La demostración no crea ni modifica hojas, y las ediciones son temporales. Al colocar una URL distinta del marcador en `env.js` y recargar la página, el frontend deja de usar los datos ficticios y llama a Apps Script.
-5. Inicia sesión y prueba el filtro de ciclo, la matriz, la exportación de un solo grupo y el botón **Generar hoja Reporte**. Comprueba también el registro y retiro manual de una asistencia de prueba.
+5. Inicia sesión y prueba el filtro de ciclo, la matriz, la exportación de un solo grupo, la alternancia de estados y el botón **Guardar**. Prueba también el botón **Generar hoja Reporte**.
 
 Si actualizas el código de Apps Script después de publicar, crea una nueva versión de la implementación web para que `/exec` utilice los cambios. Si el navegador informa un error de red/CORS, confirma que el despliegue sea accesible para esa persona, que `env.js` tenga la URL de Apps Script correcta y que no se esté usando una URL `/dev`; Apps Script no ofrece en `ContentService` una API para agregar un encabezado CORS arbitrario.
 
@@ -147,7 +150,7 @@ En AppSheet, conecta el mismo libro y agrega las tablas `Course`, `Students`, `A
 
 ## Dependencias de frontend
 
-- Bootstrap 5.3.3 por CDN para el diseño responsivo.
+- Bootstrap 5.3.3 por CDN (CSS y bundle JS) para el diseño responsivo y los popovers de hora.
 - SheetJS/XLSX 0.18.5 por CDN para generar un archivo `.xlsx` real en el navegador.
 
 La exportación contiene metadatos del curso y la matriz del curso actualmente seleccionado. No se generan archivos CSV ni exportaciones de varios grupos en una sola acción. La conectividad a los CDN es necesaria para el estilo y la exportación.
@@ -158,6 +161,8 @@ La exportación contiene metadatos del curso y la matriz del curso actualmente s
 - Los reportes físicos se crean/actualizan solo al pulsar **Generar hoja Reporte**, con limpieza de columnas de fecha sin asistencia.
 - Se separaron el backend API, la configuración pública y la interfaz estática en los archivos solicitados.
 - Se normalizaron los encabezados para el uso compartido con AppSheet sin reescribir filas existentes.
+- Se añadió la columna `Estado` a `Attendance Log` para guardar Asistencia/Falta/Justificada y un botón superior que persiste cambios en lote.
+- Las justificaciones se muestran en azul, no cuentan como falta y se excluyen del porcentaje de asistencia.
 - Se añadió selección explícita de ciclo y curso para limitar cada consulta/exportación.
 - Se añadió registro manual protegido por bloqueo, ID hexadecimal de ocho caracteres y formato real de fecha/hora de Sheets.
 - Se incorporaron login, token temporal, mensajes de error y filtros de acceso por curso.

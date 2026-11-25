@@ -3,6 +3,7 @@
 
   const environment = window.ENV || {};
   const TOKEN_STORAGE_KEY = "attendance-session-token";
+  const ATTENDANCE_STATES = ["Asistencia", "Falta", "Justificada"];
   const PREVIEW_MODE = !environment.APPS_SCRIPT_URL ||
     environment.APPS_SCRIPT_URL === "PEGA_AQUI_TU_URL_EXEC";
   const DEMO_BOOTSTRAP = {
@@ -79,6 +80,7 @@
     session: null,
     bootstrap: null,
     matrix: null,
+    pendingChanges: {},
     busy: false
   };
 
@@ -116,7 +118,7 @@
       "demo-login-info",
       "dashboard-alert", "dashboard-notice", "session-label", "logout-button",
       "demo-login-button", "cycle-filter", "course-filter", "load-matrix-button",
-      "export-button", "generate-report-button",
+      "export-button", "generate-report-button", "save-attendance-button",
       "matrix-loading", "matrix-empty", "matrix-container", "matrix-head",
       "matrix-body", "course-summary", "setup-button"
     ].forEach(function (id) {
@@ -140,6 +142,7 @@
     elements["load-matrix-button"].addEventListener("click", handleLoadMatrix);
     elements["export-button"].addEventListener("click", exportCurrentCourse);
     elements["generate-report-button"].addEventListener("click", handleGenerateReport);
+    elements["save-attendance-button"].addEventListener("click", handleSaveChanges);
     elements["setup-button"].addEventListener("click", handleRunSetup);
   }
 
@@ -251,9 +254,14 @@
     appState.matrix = null;
     resetMatrix(courses.length ? "Carga un grupo para ver su matriz." : "No hay grupos en este ciclo.");
     clearAlert(elements["dashboard-alert"]);
+    updateSaveButton();
   }
 
   async function handleLoadMatrix() {
+    if (hasPendingChanges()) {
+      showDashboardError("Guarda los cambios pendientes antes de volver a cargar la matriz.");
+      return;
+    }
     const courseId = elements["course-filter"].value;
     const cycle = elements["cycle-filter"].value;
     if (!courseId || !cycle) {
@@ -276,6 +284,7 @@
           idCurso: courseId
         });
       appState.matrix = result;
+      initializeMatrixEditState(result);
       renderMatrix(result);
       elements["export-button"].disabled = false;
       elements["generate-report-button"].disabled = PREVIEW_MODE || !result.students.length;
@@ -286,6 +295,7 @@
     } finally {
       elements["matrix-loading"].hidden = true;
       setButtonBusy(elements["load-matrix-button"], false, "Cargar matriz");
+      updateSaveButton();
     }
   }
 
@@ -312,6 +322,7 @@
     appendHeaderCell(headRow, "Cuenta", "student-account");
     appendHeaderCell(headRow, "Asistencias", "");
     appendHeaderCell(headRow, "Faltas", "");
+    appendHeaderCell(headRow, "Justificadas", "");
     appendHeaderCell(headRow, "% asistencia", "");
     (matrix.dates || []).forEach(function (date) {
       appendHeaderCell(headRow, date.label, "status-cell");
@@ -330,6 +341,7 @@
       appendCell(row, student.Cuenta || "", "student-account");
       appendCell(row, String(student.asistencias || 0), "");
       appendCell(row, String(student.faltas || 0), "");
+      appendCell(row, String(student.justificadas || 0), "");
 
       const indicatorCell = document.createElement("td");
       const indicator = document.createElement("span");
@@ -342,26 +354,43 @@
       (student.estados || []).forEach(function (status, index) {
         const cell = document.createElement("td");
         cell.className = "status-cell";
+        const state = getCellState(status);
+        const changeKey = getChangeKey(student.ID, matrix.dates[index].iso);
         const toggle = document.createElement("button");
         toggle.type = "button";
-        toggle.className = "btn btn-sm attendance-toggle " +
-          (status.presente ? "is-present" : "is-absent");
-        toggle.textContent = status.presente ? "Presente" : "Falta";
-        toggle.title = status.presente
-          ? "Presente" + (status.hora ? " · " + status.hora : "") + ". Pulsa para retirar."
-          : "Falta. Pulsa para registrar asistencia.";
+        toggle.className = "btn btn-sm attendance-toggle " + attendanceStateClass(state) +
+          (appState.pendingChanges[changeKey] ? " is-pending" : "");
+        toggle.textContent = state;
         toggle.setAttribute("aria-label",
-          student["First Name"] + ", " + matrix.dates[index].label + ": " + toggle.textContent);
+          student["First Name"] + ", " + matrix.dates[index].label + ": " +
+          state + (appState.pendingChanges[changeKey] ? ", cambio sin guardar" : ""));
+        if (state === "Asistencia" && status.hora) {
+          toggle.setAttribute("data-bs-toggle", "popover");
+          toggle.setAttribute("data-bs-trigger", "hover");
+          toggle.setAttribute("data-bs-placement", "top");
+          toggle.setAttribute("data-bs-title", "Hora de asistencia");
+          toggle.setAttribute("data-bs-content", status.hora);
+          toggle.setAttribute("aria-label",
+            student["First Name"] + ", " + matrix.dates[index].label +
+            ": Asistencia. Hora " + status.hora + ". Pulsa para cambiar el estado.");
+          if (window.bootstrap && window.bootstrap.Popover) {
+            new window.bootstrap.Popover(toggle, {
+              trigger: "hover",
+              placement: "top",
+              container: "body"
+            });
+          }
+        }
         toggle.addEventListener("click", function () {
-          toggleStudentAttendance(student, matrix.dates[index], toggle);
+          if (window.bootstrap && window.bootstrap.Popover) {
+            const popover = window.bootstrap.Popover.getInstance(toggle);
+            if (popover) {
+              popover.hide();
+            }
+          }
+          cycleAttendanceState(student, matrix.dates[index]);
         });
         cell.appendChild(toggle);
-        if (status.hora) {
-          const time = document.createElement("div");
-          time.className = "small text-secondary mt-1";
-          time.textContent = status.hora;
-          cell.appendChild(time);
-        }
         row.appendChild(cell);
       });
       elements["matrix-body"].appendChild(row);
@@ -387,80 +416,181 @@
     return "text-bg-success";
   }
 
-  async function toggleStudentAttendance(student, date, button) {
-    if (!appState.matrix || button.disabled) {
-      return;
-    }
-    button.disabled = true;
-    try {
-      if (PREVIEW_MODE) {
-        toggleDemoAttendance(student.ID, date.iso);
-        return;
-      }
-      await apiRequest("toggleAttendance", {
-        cicloEscolar: appState.matrix.course.Ciclo_Escolar,
-        idCurso: appState.matrix.course.ID_Curso,
-        idEstudiante: student.ID,
-        fecha: date.iso
+  function initializeMatrixEditState(matrix) {
+    appState.pendingChanges = {};
+    matrix.students.forEach(function (student) {
+      student.estados.forEach(function (status) {
+        const state = getCellState(status);
+        status.estado = state;
+        status.estadoInicial = state;
+        status.horaInicial = status.hora || "";
+        status.presente = state === "Asistencia";
+        status.justificada = state === "Justificada";
       });
-      await handleLoadMatrix();
-    } catch (error) {
-      button.disabled = false;
-      showDashboardError(error.message);
-    }
+    });
+    recalculateMatrixTotals(matrix);
+    updateSaveButton();
   }
 
-  function toggleDemoAttendance(studentId, isoDate) {
-    const matrix = appState.matrix;
-    const dateIndex = matrix.dates.findIndex(function (date) {
-      return date.iso === isoDate;
-    });
-    const student = matrix.students.find(function (item) {
-      return String(item.ID) === String(studentId);
-    });
-    if (!student || dateIndex < 0) {
+  function getCellState(status) {
+    if (ATTENDANCE_STATES.indexOf(status.estado) !== -1) {
+      return status.estado;
+    }
+    return status.presente ? "Asistencia" : "Falta";
+  }
+
+  function attendanceStateClass(state) {
+    if (state === "Asistencia") {
+      return "is-present";
+    }
+    if (state === "Justificada") {
+      return "is-justified";
+    }
+    return "is-absent";
+  }
+
+  function getChangeKey(studentId, isoDate) {
+    return String(studentId) + "|" + isoDate;
+  }
+
+  function cycleAttendanceState(student, date) {
+    if (!appState.matrix) {
       return;
     }
 
-    const status = student.estados[dateIndex];
-    status.presente = !status.presente;
-    status.hora = status.presente ? "08:00:00" : "";
-    status.logId = status.presente ? "d3e01234" : "";
-
-    const retainedDateIndexes = matrix.dates.map(function (date, index) {
-      return index;
-    }).filter(function (index) {
-      return matrix.students.some(function (item) {
-        return item.estados[index].presente;
-      });
+    const dateIndex = appState.matrix.dates.findIndex(function (item) {
+      return item.iso === date.iso;
     });
-    if (retainedDateIndexes.length !== matrix.dates.length) {
-      matrix.dates = retainedDateIndexes.map(function (index) {
-        return matrix.dates[index];
-      });
-      matrix.students.forEach(function (item) {
-        item.estados = retainedDateIndexes.map(function (index) {
-          return item.estados[index];
-        });
-      });
+    const currentStudent = appState.matrix.students.find(function (item) {
+      return String(item.ID) === String(student.ID);
+    });
+    if (dateIndex < 0 || !currentStudent) {
+      return;
     }
 
-    matrix.students.forEach(function (item) {
-      item.asistencias = item.estados.filter(function (itemStatus) {
-        return itemStatus.presente;
+    const status = currentStudent.estados[dateIndex];
+    const currentState = getCellState(status);
+    const nextIndex = (ATTENDANCE_STATES.indexOf(currentState) + 1) % ATTENDANCE_STATES.length;
+    const nextState = ATTENDANCE_STATES[nextIndex];
+    status.estado = nextState;
+    status.presente = nextState === "Asistencia";
+    status.justificada = nextState === "Justificada";
+    if (nextState === status.estadoInicial) {
+      status.hora = status.horaInicial;
+    } else if (nextState !== "Asistencia" || currentState !== "Asistencia") {
+      status.hora = "";
+    }
+
+    const key = getChangeKey(currentStudent.ID, date.iso);
+    if (nextState === status.estadoInicial) {
+      delete appState.pendingChanges[key];
+    } else {
+      appState.pendingChanges[key] = {
+        idEstudiante: currentStudent.ID,
+        fecha: date.iso,
+        estado: nextState
+      };
+    }
+
+    recalculateMatrixTotals(appState.matrix);
+    renderMatrix(appState.matrix);
+    updateSaveButton();
+  }
+
+  function recalculateMatrixTotals(matrix) {
+    matrix.students.forEach(function (student) {
+      student.estados.forEach(function (status) {
+        status.estado = getCellState(status);
+      });
+      student.asistencias = student.estados.filter(function (status) {
+        return status.estado === "Asistencia";
       }).length;
-      item.faltas = item.estados.length - item.asistencias;
-      item.porcentaje = item.estados.length
-        ? Math.round((item.asistencias / item.estados.length) * 10000) / 100
+      student.faltas = student.estados.filter(function (status) {
+        return status.estado === "Falta";
+      }).length;
+      student.justificadas = student.estados.filter(function (status) {
+        return status.estado === "Justificada";
+      }).length;
+      const eligibleDays = student.estados.length - student.justificadas;
+      student.porcentaje = student.estados.length
+        ? (eligibleDays
+          ? Math.round((student.asistencias / eligibleDays) * 10000) / 100
+          : 100)
         : 0;
     });
-    renderMatrix(matrix);
-    elements["export-button"].disabled = false;
-    elements["generate-report-button"].disabled = true;
-    showNotice("Modo demostración: el cambio es temporal y no se guarda en Sheets.");
+  }
+
+  function hasPendingChanges() {
+    return Object.keys(appState.pendingChanges).length > 0;
+  }
+
+  function updateSaveButton() {
+    const count = Object.keys(appState.pendingChanges).length;
+    const button = elements["save-attendance-button"];
+    if (!button) {
+      return;
+    }
+    button.disabled = count === 0;
+    button.textContent = count ? "Guardar cambios (" + count + ")" : "Guardar";
+    elements["cycle-filter"].disabled =
+      count > 0 || !appState.bootstrap || !appState.bootstrap.cycles.length;
+    const currentCycle = elements["cycle-filter"].value;
+    const hasCurrentCourses = !!(appState.bootstrap && appState.bootstrap.courses.some(function (course) {
+      return String(course.Ciclo_Escolar || "").trim() === currentCycle;
+    }));
+    elements["course-filter"].disabled = count > 0 || !hasCurrentCourses;
+  }
+
+  async function handleSaveChanges() {
+    const changes = Object.keys(appState.pendingChanges).map(function (key) {
+      return appState.pendingChanges[key];
+    });
+    if (!changes.length || !appState.matrix) {
+      return;
+    }
+
+    const button = elements["save-attendance-button"];
+    button.disabled = true;
+    button.textContent = "Guardando...";
+    try {
+      if (PREVIEW_MODE) {
+        appState.matrix.students.forEach(function (student) {
+          student.estados.forEach(function (status) {
+            if (status.estado === "Asistencia" && !status.hora) {
+              status.hora = "08:00:00";
+            }
+            status.estadoInicial = status.estado;
+            status.horaInicial = status.hora || "";
+          });
+        });
+        appState.pendingChanges = {};
+        renderMatrix(appState.matrix);
+        updateSaveButton();
+        showNotice("Cambios aplicados solo a la demostración local; no se guardaron en Google Sheets.");
+        return;
+      }
+
+      const result = await apiRequest("saveAttendanceChanges", {
+        cicloEscolar: appState.matrix.course.Ciclo_Escolar,
+        idCurso: appState.matrix.course.ID_Curso,
+        changes: changes
+      });
+      appState.pendingChanges = {};
+      updateSaveButton();
+      await handleLoadMatrix();
+      showNotice(result.message);
+    } catch (error) {
+      showDashboardError(error.message);
+    } finally {
+      updateSaveButton();
+    }
   }
 
   async function handleGenerateReport() {
+    if (hasPendingChanges()) {
+      showDashboardError("Guarda los cambios pendientes antes de generar el reporte.");
+      return;
+    }
     if (PREVIEW_MODE) {
       showNotice("La generación en Sheets requiere configurar una URL /exec válida en env.js.");
       return;
@@ -510,6 +640,7 @@
         "Cuenta",
         "Asistencias",
         "Faltas",
+        "Justificadas",
         "Porcentaje"
       ].concat(matrix.dates.map(function (date) {
         return date.label;
@@ -518,9 +649,10 @@
 
     matrix.students.forEach(function (student) {
       const attendanceCells = student.estados.map(function (status) {
-        return status.presente
-          ? "Presente" + (status.hora ? " " + status.hora : "")
-          : "Falta";
+        const state = getCellState(status);
+        return state === "Asistencia" && status.hora
+          ? state + " " + status.hora
+          : state;
       });
       rows.push([
         student.ID,
@@ -528,13 +660,14 @@
         student.Cuenta || "",
         student.asistencias,
         student.faltas,
+        student.justificadas,
         Number(student.porcentaje || 0) / 100
       ].concat(attendanceCells));
     });
 
     const worksheet = XLSX.utils.aoa_to_sheet(rows);
     matrix.students.forEach(function (student, index) {
-      const percentageAddress = XLSX.utils.encode_cell({ r: 7 + index, c: 5 });
+      const percentageAddress = XLSX.utils.encode_cell({ r: 7 + index, c: 6 });
       if (worksheet[percentageAddress]) {
         worksheet[percentageAddress].z = "0.00%";
       }
@@ -550,6 +683,10 @@
   }
 
   async function handleRunSetup() {
+    if (hasPendingChanges()) {
+      showDashboardError("Guarda o descarta los cambios pendientes antes de verificar los encabezados.");
+      return;
+    }
     if (PREVIEW_MODE) {
       showDashboardError("El modo demostración no está conectado a Google Sheets.");
       return;
@@ -619,9 +756,14 @@
   }
 
   function handleLogout() {
+    if (hasPendingChanges() &&
+        !window.confirm("Hay cambios sin guardar. ¿Quieres descartarlos y cerrar sesión?")) {
+      return;
+    }
     clearSession();
     appState.bootstrap = null;
     appState.matrix = null;
+    appState.pendingChanges = {};
     elements["login-form"].reset();
     clearAlert(elements["login-alert"]);
     showLoginView();
